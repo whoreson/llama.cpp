@@ -18,6 +18,8 @@ function! Llm()
 
   " Insert the content at the cursor position
   call setline(line('.'), getline('.') . content)
+
+  " Replace 0x00 with newline
   silent! %s/\%x00/\r/g
 endfunction
 
