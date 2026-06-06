@@ -77,6 +77,7 @@ enum rpc_cmd {
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
+const float RPC_MEMORY_SAFETY_MARGIN = 0.95f; 
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
 struct rpc_msg_hello_req {
@@ -1413,9 +1414,13 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
     size_t free, total;
     ggml_backend_dev_t dev = ggml_backend_get_device(backends[dev_id]);
     ggml_backend_dev_memory(dev, &free, &total);
-    response.free_mem = free;
-    response.total_mem = total;
-    LOG_DBG("[%s] device: %u, free_mem: %" PRIu64 ", total_mem: %" PRIu64 "\n", __func__, dev_id, response.free_mem, response.total_mem);
+
+    // Apply safety margin so the client allocator leaves room for overhead/OS
+    response.free_mem  = (uint64_t)(free  * RPC_MEMORY_SAFETY_MARGIN);
+    response.total_mem = (uint64_t)(total * RPC_MEMORY_SAFETY_MARGIN);
+
+    LOG_DBG("[%s] device: %u, actual_free: %zu, reported_free: %" PRIu64 "\n", 
+            __func__, dev_id, free, response.free_mem);
     return true;
 }
 
@@ -1710,8 +1715,16 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         auto dev = devices[i];
         size_t free, total;
         ggml_backend_dev_memory(dev, &free, &total);
-        printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
-               total / 1024 / 1024, free / 1024 / 1024);
+		// Calculate adjusted values for the log
+		size_t adj_free  = (size_t)(free  * RPC_MEMORY_SAFETY_MARGIN);
+		size_t adj_total = (size_t)(total * RPC_MEMORY_SAFETY_MARGIN);
+
+		printf("  %s: %s (%zu MiB total, %zu MiB free) [OOM Safety: Reporting %d%%]\n", 
+			   ggml_backend_dev_name(dev), 
+			   ggml_backend_dev_description(dev),
+			   adj_total / 1024 / 1024, 
+			   adj_free / 1024 / 1024,
+			   (int)(RPC_MEMORY_SAFETY_MARGIN * 100));
         auto backend = ggml_backend_dev_init(dev, nullptr);
         if (!backend) {
             fprintf(stderr, "Failed to create backend for device %s\n", dev->iface.get_name(dev));

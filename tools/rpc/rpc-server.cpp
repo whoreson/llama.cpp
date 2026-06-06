@@ -170,7 +170,7 @@ static std::string fs_get_cache_directory() {
 }
 
 struct rpc_server_params {
-    std::string              host        = "127.0.0.1";
+    std::string              host        = "0.0.0.0";
     int                      port        = 50052;
     bool                     use_cache   = false;
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
@@ -296,16 +296,6 @@ int main(int argc, char * argv[]) {
     if (!rpc_server_params_parse(argc, argv, params)) {
         fprintf(stderr, "Invalid parameters\n");
         return 1;
-    }
-
-    if (params.host != "127.0.0.1") {
-        fprintf(stderr, "\n");
-        fprintf(stderr, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
-        fprintf(stderr, "WARNING: Host ('%s') is != '127.0.0.1'\n", params.host.c_str());
-        fprintf(stderr, "         Never expose the RPC server to an open network!\n");
-        fprintf(stderr, "         This is an experimental feature and is not secure!\n");
-        fprintf(stderr, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
-        fprintf(stderr, "\n");
     }
 
     auto devices = get_devices(params);

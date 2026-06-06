@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <fstream>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -52,6 +53,90 @@ static uint32_t server_n_outputs_max(const common_params & params) {
     return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
 }
 
+
+// save slot checkpoints to a companion file (<filepath>.checkpoints)
+static size_t _slot_save_checkpoints(const std::string & filepath,
+                                      const std::list<server_prompt_checkpoint> & checkpoints) {
+    if (checkpoints.empty()) {
+        return 0;
+    }
+    const std::string ckpt_path = filepath + ".checkpoints";
+    std::ofstream file(ckpt_path, std::ios::binary);
+    if (!file.is_open()) {
+        SRV_WRN("failed to open checkpoint file for writing: %s\n", ckpt_path.c_str());
+        return 0;
+    }
+
+    const uint32_t magic   = LLAMA_STATE_SEQ_MAGIC;
+    const uint32_t version = LLAMA_STATE_SEQ_VERSION;
+    const uint64_t count   = (uint64_t) checkpoints.size();
+
+    file.write(reinterpret_cast<const char*>(&magic),   sizeof(magic));
+    file.write(reinterpret_cast<const char*>(&version), sizeof(version));
+    file.write(reinterpret_cast<const char*>(&count),   sizeof(count));
+
+    for (const auto & ckpt : checkpoints) {
+        file.write(reinterpret_cast<const char*>(&ckpt.pos_min),  sizeof(ckpt.pos_min));
+        file.write(reinterpret_cast<const char*>(&ckpt.pos_max),  sizeof(ckpt.pos_max));
+        file.write(reinterpret_cast<const char*>(&ckpt.n_tokens), sizeof(ckpt.n_tokens));
+        const uint64_t data_size = (uint64_t) ckpt.data.size();
+        file.write(reinterpret_cast<const char*>(&data_size), sizeof(data_size));
+        if (data_size > 0) {
+            file.write(reinterpret_cast<const char*>(ckpt.data.data()), data_size);
+        }
+    }
+    file.close();
+    return count;
+}
+
+// load slot checkpoints from a companion file (<filepath>.checkpoints)
+static size_t _slot_load_checkpoints(const std::string & filepath,
+                                      std::list<server_prompt_checkpoint> & checkpoints) {
+    const std::string ckpt_path = filepath + ".checkpoints";
+    std::ifstream file(ckpt_path, std::ios::binary);
+    if (!file.is_open()) {
+        return 0;
+    }
+
+    uint32_t magic;
+    file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    uint32_t version;
+    file.read(reinterpret_cast<char*>(&version), sizeof(version));
+
+    if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
+        SRV_WRN("invalid checkpoint file magic/version: %08x, %08x (expected %08x, %08x): %s\n",
+                magic, version, (uint32_t)LLAMA_STATE_SEQ_MAGIC, (uint32_t)LLAMA_STATE_SEQ_VERSION, ckpt_path.c_str());
+        file.close();
+        return 0;
+    }
+
+    uint64_t count;
+    file.read(reinterpret_cast<char*>(&count), sizeof(count));
+
+    checkpoints.clear();
+    for (uint64_t i = 0; i < count; ++i) {
+        server_prompt_checkpoint ckpt;
+        ckpt.pos_min  = 0;
+        ckpt.pos_max  = 0;
+        ckpt.n_tokens = 0;
+
+        file.read(reinterpret_cast<char*>(&ckpt.pos_min),  sizeof(ckpt.pos_min));
+        file.read(reinterpret_cast<char*>(&ckpt.pos_max),  sizeof(ckpt.pos_max));
+        file.read(reinterpret_cast<char*>(&ckpt.n_tokens), sizeof(ckpt.n_tokens));
+
+        uint64_t data_size;
+        file.read(reinterpret_cast<char*>(&data_size), sizeof(data_size));
+
+        if (data_size > 0) {
+            ckpt.data.resize(data_size);
+            file.read(reinterpret_cast<char*>(ckpt.data.data()), data_size);
+        }
+        checkpoints.push_back(std::move(ckpt));
+    }
+    file.close();
+    return count;
+}
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
@@ -83,6 +168,11 @@ struct server_slot {
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
+
+    // pre-processing checkpoint for cancellation recovery
+    server_prompt_checkpoint pre_processing_ckpt;
+    int32_t n_prompt_tokens_pre_processing = 0;
+    bool has_pre_processing_ckpt = false;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -228,6 +318,11 @@ struct server_slot {
 
         // clear alora start
         alora_invocation_start = -1;
+
+        // clear pre-processing checkpoint
+        pre_processing_ckpt.clear();
+        has_pre_processing_ckpt = false;
+        n_prompt_tokens_pre_processing = 0;
     }
 
     void init_sampler() const {
@@ -373,6 +468,8 @@ struct server_slot {
         if (is_processing()) {
             GGML_ASSERT(task);
 
+            const slot_state prev_state = state;
+
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
             t_last_used        =  ggml_time_us();
@@ -383,6 +480,26 @@ struct server_slot {
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
                 prompt_clear(false);
+            }
+
+            // recover from cancelled prompt processing: restore pre-processing state
+            // this prevents the KV cache from getting dirty with partial tokens
+            if (has_pre_processing_ckpt && prev_state == SLOT_STATE_PROCESSING_PROMPT) {
+                const size_t ckpt_size = pre_processing_ckpt.data.size();
+                if (ckpt_size > 0) {
+                    const size_t n = llama_state_seq_set_data_ext(
+                        ctx, pre_processing_ckpt.data.data(), ckpt_size,
+                        id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+                    if (n == ckpt_size) {
+                        const int n_safe = n_prompt_tokens_pre_processing;
+                        if (n_safe > 0) {
+                            llama_memory_seq_rm(llama_get_memory(ctx), id, n_safe, -1);
+                        }
+                        prompt.tokens.keep_first(n_safe);
+                        SLT_WRN(*this, "restored KV cache after cancelled prompt processing (kept %d cached tokens)\n", n_safe);
+                    }
+                }
             }
 
             reset();
@@ -532,6 +649,7 @@ struct server_slot {
                     {"has_new_line",   has_new_line},
                     {"n_remain",       n_remaining},
                     {"n_decoded",      n_decoded},
+                    {"stopping_word",  stopping_word},
                 }
             };
 
@@ -561,8 +679,11 @@ struct server_slot {
 
         other.t_start_process_prompt    = t_start_process_prompt;
         other.t_prompt_processing       = t_prompt_processing;
-        other.n_prompt_tokens_cache     = n_prompt_tokens_cache;
-        other.n_prompt_tokens_processed = n_prompt_tokens_processed;
+        other.n_prompt_tokens_cache             = n_prompt_tokens_cache;
+        other.n_prompt_tokens_processed         = n_prompt_tokens_processed;
+        other.pre_processing_ckpt               = pre_processing_ckpt;
+        other.n_prompt_tokens_pre_processing    = n_prompt_tokens_pre_processing;
+        other.has_pre_processing_ckpt           = has_pre_processing_ckpt;
 
         other.prompt = prompt.clone();
         other.init_sampler();
@@ -1030,10 +1151,13 @@ private:
         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
 
         int n_ctx_slot = llama_n_ctx_seq(ctx_tgt);
+        // nope, this kills yarn, why the FUCK would you do this
+/*
         if (n_ctx_slot > n_ctx_train) {
             SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
             n_ctx_slot = n_ctx_train;
         }
+*/
 
         slots.clear();
 
@@ -2171,7 +2295,7 @@ private:
                     int n_processing_slots = 0;
 
                     for (server_slot & slot : slots) {
-                        json slot_data = slot.to_json(slots_debug == 0);
+                        json slot_data = slot.to_json(false);
 
                         if (slot.is_processing()) {
                             n_processing_slots++;
@@ -2239,6 +2363,9 @@ private:
                     const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
 
+                    // save checkpoints to companion file
+                    _slot_save_checkpoints(filepath, slot->prompt.checkpoints);
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2278,13 +2405,21 @@ private:
                     size_t token_count = 0;
                     size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
                     if (nread == 0) {
-                        slot->prompt.tokens.clear(); // KV may already been invalidated?
                         send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
                     tokens.resize(token_count);
                     slot->prompt.tokens.clear();
                     slot->prompt.tokens.insert(tokens);
+
+                    // load checkpoints from companion file
+                    {
+                        _slot_load_checkpoints(filepath, slot->prompt.checkpoints);
+                        // trim to configured limit if necessary
+                        while (slot->prompt.checkpoints.size() > (size_t) params_base.n_ctx_checkpoints) {
+                            slot->prompt.checkpoints.pop_front();
+                        }
+                    }
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -2705,8 +2840,8 @@ private:
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
-                                // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
+                                // if there is an alora invoked, don't cache after the invocation start                                if (slot.alora_invocation_start > 0) {
                                     SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
                                     n_past = std::min(n_past, slot.alora_invocation_start - 1);
                                 }
@@ -3117,6 +3252,18 @@ private:
 
                     // no need to create checkpoints that are too close together
                     do_checkpoint = do_checkpoint && (slot.prompt.checkpoints.empty() || n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+
+                    // enforce minimum token distance between checkpoints (overrides other settings)
+                    // otherwise enjoy having hundreds of checkpoints every few dozen tokens, while
+                    // the ones at the very beginning are obliterated with not even one remaining,
+                    // have fun reprocessing goy
+                    if (do_checkpoint && params_base.checkpoint_min_nt > 0) {
+                        const int64_t tokens_since_last = slot.prompt.checkpoints.empty()
+                                ? slot.prompt.n_tokens() - n_tokens_cur
+                                : slot.prompt.n_tokens() - n_tokens_cur - slot.prompt.checkpoints.back().n_tokens;
+                        do_checkpoint = tokens_since_last >= params_base.checkpoint_min_nt;
+                    }
+
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not

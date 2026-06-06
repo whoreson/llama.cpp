@@ -450,7 +450,7 @@ struct common_params {
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
-    bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
+    bool    fit_params         = false;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
 
@@ -531,7 +531,7 @@ struct common_params {
     bool usage             = false; // print usage
     bool completion        = false; // print source-able completion script
     bool use_color         = false; // use color to distinguish generations and inputs
-    bool special           = false; // enable special token output
+    bool special           = true; // enable special token output
     bool interactive       = false; // interactive mode
     bool interactive_first = false; // wait for user input immediately
     bool prompt_cache_all  = false; // save user input and generations to prompt cache
@@ -545,10 +545,10 @@ struct common_params {
     bool show_timings      = true;  // show timing information on CLI
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
-    bool kv_unified        = false; // enable unified KV cache
+    bool kv_unified        = true; // enable unified KV cache
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
-    bool use_mmap          = true;  // enable mmap to use filesystem cache
+    bool use_mmap          = false;  // enable mmap to use filesystem cache
     bool use_direct_io     = false; // read from disk without buffering
     bool use_mlock         = false; // use mlock to keep model in memory
     bool verbose_prompt    = false; // print prompt tokens before generation
@@ -599,9 +599,10 @@ struct common_params {
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 256;   // minimum spacing between context checkpoints
-    int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    int32_t checkpoint_min_nt   = 0;     // minimum tokens between any two checkpoints (0 = disabled)
+    int32_t cache_ram_mib       = 0;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
-    std::string hostname      = "127.0.0.1";
+    std::string hostname      = "0.0.0.0";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT

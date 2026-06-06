@@ -1,6 +1,13 @@
+if (WIN32)
+       add_compile_definitions(_WIN32_WINNT=0x0601)
+endif()
 cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit target directories.
 project("llama.cpp" C CXX)
 include(CheckIncludeFileCXX)
+
+set(LLAMA_BUILD_WEBUI OFF)
+set(LLAMA_BUILD_UI OFF)
+set(LLAMA_USE_PREBUILT_UI OFF)
 
 #set(CMAKE_WARN_DEPRECATED YES)
 set(CMAKE_WARN_UNUSED_CLI YES)

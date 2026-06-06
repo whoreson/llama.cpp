@@ -1458,7 +1458,7 @@ mmap::~mmap() { close(); }
 
 bool mmap::open(const char *path) {
   close();
-
+#if 0 // fuck httplib
 #if defined(_WIN32)
   auto wpath = u8string_to_wstring(path);
   if (wpath.empty()) { return false; }
@@ -1522,7 +1522,7 @@ bool mmap::open(const char *path) {
     return false;
   }
 #endif
-
+#endif
   return true;
 }
 
